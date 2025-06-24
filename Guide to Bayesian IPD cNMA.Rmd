@@ -1,0 +1,677 @@
+---
+title: "Guide"
+author: "Constantin Yves Plessen"
+date: "2025-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# libraries -------------------------------------------------------------
+library(rjags)
+library(stringr)
+library(netmeta)
+library(taRifx)
+library(ggplot2)
+install.packages("openxlsx")
+library(openxlsx)
+library(readxl)
+library(MCMCvis)
+library(tidyr)
+library(igraph)
+options(digits=2)
+rm(list=ls()) 
+
+
+# set up data  --------------------------------------------------------------------------------------
+d2=read_xlsx("panic_disorder.xlsx")
+d2$comb=""
+for(j in 1:length(d2$study)){
+  for (i in (which(colnames(d2)=="wl")):(which(colnames(d2)=="w3"))){
+    if(d2[j,i]=="1"){d2$comb[j]=paste(d2$comb[j], "+",colnames(d2)[i])}  }}
+d2$comb=substr(d2$comb,4, nchar(d2$comb))
+d2$study=as.character(d2$study)
+d2$stud.comb=paste(d2$study,"|",  d2$comb ,"[", d2$Treatment, sep="")
+d3=d2[, c("stud.comb", "N", "event")]
+d4=aggregate(.~stud.comb, d3, sum, na.rm=T)
+d4$study=word(d4$stud.comb,1,sep = "\\|")
+d4$comb2=word(word(d4$stud.comb,2,sep = "\\|"), 1, sep="\\[")
+d4$treat=word(word(d4$stud.comb,2,sep = "\\|"), 2, sep="\\[")
+d5=d4[, c("study", "treat", "N", "event", "comb2")]
+components=c("wl", "pl", "ftf", "pe", "ps", "br", "mr", "ive", "ine", "vre", "cr", "w3")
+Nc=length(components)
+for (i in 1:Nc){
+  for(j in 1:length(d5$event)){ eval(parse(text=(paste("d5$", components[i],"[j]=",1*grepl(components[i], d5$comb)[j], sep=""))))   }}
+
+d5$arm=0
+studies=unique(d5$study)
+Ns=length(studies)
+na=c()
+for (i in 1:Ns){j=length(d5$arm[d5$study==studies[i]])
+na=c(na,j)}
+for(i in 1:Ns){  d5$arm[d5$study==studies[i]]=1:na[i]}
+
+d6=d5[,c(which(colnames(d5)=="study"),which(colnames(d5)=="arm"),which(colnames(d5)=="N"))]
+n <- spread(d6, arm, N)[,2:5] 
+
+d6=d5[,c(which(colnames(d5)=="study"),which(colnames(d5)=="arm"),which(colnames(d5)=="event"))]
+r <- spread(d6, arm, event)[,2:5] 
+
+
+for(i in 1:Nc){
+  d6=d5[,c(which(colnames(d5)=="study"),which(colnames(d5)=="arm"),which(colnames(d5)==components[i]))]
+  d6[,3]=as.numeric(d6[,3])
+  assign( paste("c",i, sep=""), spread(d6, arm,components[i])[,2:5] )}
+
+table(d5$treat)
+d5$treat[d5$treat=="BT (br+ine+ive)"|d5$treat=="BT (ive)"|d5$treat=="BT (ive+mr+br)"]="BT"
+d5$treat[d5$treat=="CBT (+br)"|d5$treat=="CBT (+ine)"|d5$treat=="CBT (+ive)"
+         |d5$treat=="CBT (+vre)"|d5$treat=="CBT (vre)"|d5$treat=="CBT (vre+ine)"]="CBT"
+d5$treat[d5$treat=="NT (No Treatment)"]="NT"
+d5$treat[d5$treat=="WL (+SH-PE)"]="WL"
+
+
+# create netplot  --------------------------------------------------------------------------------------
+d7=d5[, c("study",  "treat", "N", "event" )]
+d7$combstu=paste(d7$study, "|", d7$treat, sep="")
+d8=aggregate(.~combstu, data=d7[,c(3,4,5)], sum)
+d8$study=word(d8$combstu,1,sep = "\\|")
+d8$treat=word(d8$combstu,2,sep = "\\|")
+
+pn <- pairwise(studlab = d8$study, treat=d8$treat, event=d8$event, n=d8$N)
+net=netmeta(pn)
+netgraph(net, seq = "optimal", col = "black", plastic = FALSE,
+         points = TRUE, pch = 21, cex.points = 3, col.points = "black",
+         bg.points = "gray", thickness = "se.random",
+         multiarm = FALSE, number.of.studies = TRUE)
+
+
+# run discomb NO INTERACTION MODEL  --------------------------------------------------------------------------------------
+p1 <- pairwise(studlab = d5$study, treat=d5$comb2, event=d5$event, n=d5$N)
+nc1 <- discomb(p1$TE, p1$seTE, p1$treat1, p1$treat2, p1$studlab, sm = "OR", comb.random = TRUE)
+
+tt=graph.data.frame(p1[,c(4,5)], directed = F)
+
+plot(tt, vertex.size=5,vertex.label.cex=0.7, edge.color="gray55",vertex.size=10,vertex.color="gray65",
+     vertex.label.font=3, vertex.label.color="black", vertex.label.dist=0,layout=layout.circle(tt))
+
+
+#  NO INTERACTION MODEL  --------------------------------------------------------------------------------------
+model1.string <-  "
+model {
+for(i in 1:Ns) { 
+w[i,1]<- 0
+theta[i,1]<- 0                                             
+for (k in 1:na[i]) {r[i,k] ~ dbin(p[i,k],n[i,k])}                                                   
+logit(p[i,1])<- u[i]		                    
+for (k in 2:na[i]) {
+logit(p[i,k])<- u[i] + theta[i,k]
+
+##distribution of random effects
+theta[i,k] ~ dnorm(md[i,k],precd[i,k])
+
+## accounting for correlation between effect sizes estimated in multi-arm trials				             
+md[i,k]<- mean[i,k]+ sw[i,k]                                   
+w[i,k]<- (theta[i,k]  - mean[i,k])          
+sw[i,k]<- sum(w[i,1:(k-1)])/(k-1)
+precd[i,k]<- prec *2*(k-1)/k  
+
+##consistency equations
+mean[i,k] <-A1[i,k]-B1[i]
+A1[i,k]<-
+d[1]*(1-equals(c1[i,k],0)) + d[2]*(1-equals(c2[i,k],0))+
+d[3]*(1-equals(c3[i,k],0)) + d[4]*(1-equals(c4[i,k],0)) +
+d[5]*(1-equals(c5[i,k],0)) + d[6]*(1-equals(c6[i,k],0)) + 
+d[7]*(1-equals(c7[i,k],0)) + d[8]*(1-equals(c8[i,k],0)) + 
+d[9]*(1-equals(c9[i,k],0)) + d[10]*(1-equals(c10[i,k],0))+
+d[11]*(1-equals(c11[i,k],0)) + d[12]*(1-equals(c12[i,k],0)) }
+
+B1[i]<-
+d[1]*(1-equals(c1[i,1],0))  + d[2]*(1-equals(c2[i,1],0))+
+d[3]*(1-equals(c3[i,1],0))  + d[4]*(1-equals(c4[i,1],0)) +
+d[5]*(1-equals(c5[i,1],0))  + d[6]*(1-equals(c6[i,1],0)) + 
+d[7]*(1-equals(c7[i,1],0))  + d[8]*(1-equals(c8[i,1],0)) + 
+d[9]*(1-equals(c9[i,1],0))  + d[10]*(1-equals(c10[i,1],0)) + 
+d[11]*(1-equals(c11[i,1],0))+ d[12]*(1-equals(c12[i,1],0))}
+
+##prior distribution for log-odds in baseline arm of study i
+for (i in 1:Ns) {	u[i] ~ dnorm(0,.01)	}
+
+## informative prior distribution for heterogeneity	
+prec<-1/tau
+tau~dlnorm(-1.67,inv.sd)
+inv.sd<-1/(1.472*1.472)
+	
+
+## example comparisons
+example1<-exp(d[2]+d[3]+d[4]+d[5]+d[8] - d[1])  ### (pl + ftf + pe + ps + ive)  VS (wl)
+example2<-exp(d[2]+d[3]+d[4]+d[5]+d[8]+d[11] -d[2]-d[3]-d[5]-d[7]) ### (pl + ftf + pe + ps + ive + cr)  VS (pl + ftf + ps + mr)
+example3<-exp(d[2]+d[3]+d[8]+d[11]-d[2]-d[4]-d[6] -d[7]-d[9]-d[11]) ### (pf + ftf + ps + ive + cr) vs. (pl + pe + br +mr +ine +cr)
+
+
+##prior distribution for basic parameters		
+for(k in 1:Nc) {d[k] ~ dnorm(0,.01)}
+for(k in 1:Nc) {ORd[k]<- exp(d[k])}}
+"
+
+model1.spec<-textConnection(model1.string) 
+data <- list(r=r,n=n, Ns=Ns, Nc=Nc, c1=c1, c2=c2, c3=c3, c4=c4, c5=c5, c6=c6, c7=c7, c8=c8, 
+             c9=c9, c10=c10, c11=c11, c12=c12,  na=na)
+jags.m=0
+jags.m <- jags.model(model1.spec, data = data, n.chains =4, n.adapt = 10000)
+
+params <- c("tau","d", "ORd", "example1", "example2", "example3") 
+closeAllConnections()
+samps<- coda.samples(jags.m, params, n.iter =30000)
+
+MCMCtrace(samps,pdf = FALSE, params = "d") 
+
+A1= MCMCsummary(samps)
+rownames(A1)[1:12]=components
+rownames(A1)[13:24]=paste("logOR -", components)
+round(A1[,c(4,3,5)], digits=3)
+
+A1$results=paste(format(round(A1$`50%`,2), nsmall=2), "[", 
+                 format(round(A1$`2.5%`,2), nsmall=2), ";", 
+                 format(round(A1$`97.5%`,2), nsmall=2), "]", sep="")
+
+
+
+
+# define useful functions  --------------------------------------------------------------------------------------
+
+place=function(i, j){
+  if(i<j){pl=(2*Nc-i)*(i-1)/2+j-i}
+  if(j<i){
+    j1=j; i1=i;i=j1; j=i1 
+    pl=(2*Nc-i)*(i-1)/2+j-i}
+  return(pl)}
+
+which.place=function(n){
+  for (k in 1:(Nc-1)){
+    for (l in (k+1):Nc){
+      if(place(k,l)==n){pl=(paste(k,l))
+      compo=paste(components[k],"-", components[l])
+      }
+      
+    }}
+  return(c(pl, compo))}
+
+all.interactions=function(combination){
+  ## eg combination=c(2,4,5,11,12,15,16)
+  nc=length(combination)
+  combination=sort(combination)
+  interactions=c()
+  for ( i in 1:(nc-1)){
+    for (j in (i+1):nc){
+      interactions=c(interactions,place(combination[i],combination[j]))      }    }
+  return(interactions)}
+
+
+
+
+# define interactions -----------------------------------------------------
+Ninter=Nc*(Nc-1)/2
+interactions=array(NA, dim=c(Ns, 4, Ninter))
+for (i in 1: Ns){
+  for (j in 1:na[i]){
+    place1=0
+    for (k in 1:(Nc-1)){
+      for (l in (k+1):Nc){
+        place1=place1+1
+        interactions[i, j, place1]=
+          eval(parse(text=paste("c", k, sep="")))[i, j]*eval(parse(text=paste("c", l, sep="")))[i, j] }     }   }}
+
+
+
+# SSVS INTERACTION MODEL, all interactions equiprobable -----------------------------------------------------
+
+model1.string <-  "
+model {
+for(i in 1:Ns) { 
+w[i,1]<- 0
+theta[i,1]<- 0                                             
+for (k in 1:na[i]) {r[i,k] ~ dbin(p[i,k],n[i,k])}                                                   
+logit(p[i,1])<- u[i]		                    
+for (k in 2:na[i]) {
+logit(p[i,k])<- u[i] + theta[i,k]
+
+##distribution of random effects
+theta[i,k] ~ dnorm(md[i,k],precd[i,k])
+
+## accounting for correlation between effect sizes estimated in multi-arm trials				             
+md[i,k]<- mean[i,k]+ sw[i,k]                                   
+w[i,k]<- (theta[i,k]  - mean[i,k])          
+sw[i,k]<- sum(w[i,1:(k-1)])/(k-1)
+precd[i,k]<- prec *2*(k-1)/k  
+
+##consistency equations
+mean[i,k] <-A1[i,k]-B1[i]
+A1[i,k]<-
+d[1]*(1-equals(c1[i,k],0)) + d[2]*(1-equals(c2[i,k],0))+
+d[3]*(1-equals(c3[i,k],0)) + d[4]*(1-equals(c4[i,k],0)) +
+d[5]*(1-equals(c5[i,k],0)) + d[6]*(1-equals(c6[i,k],0)) + 
+d[7]*(1-equals(c7[i,k],0)) + d[8]*(1-equals(c8[i,k],0)) + 
+d[9]*(1-equals(c9[i,k],0)) + d[10]*(1-equals(c10[i,k],0))+
+d[11]*(1-equals(c11[i,k],0)) + d[12]*(1-equals(c12[i,k],0)) + inprod(gamma[], interactions[i,k,]) }
+
+B1[i]<-
+d[1]*(1-equals(c1[i,1],0))  + d[2]*(1-equals(c2[i,1],0))+
+d[3]*(1-equals(c3[i,1],0))  + d[4]*(1-equals(c4[i,1],0)) +
+d[5]*(1-equals(c5[i,1],0))  + d[6]*(1-equals(c6[i,1],0)) + 
+d[7]*(1-equals(c7[i,1],0))  + d[8]*(1-equals(c8[i,1],0)) + 
+d[9]*(1-equals(c9[i,1],0))  + d[10]*(1-equals(c10[i,1],0)) + 
+d[11]*(1-equals(c11[i,1],0))+ d[12]*(1-equals(c12[i,1],0))+ inprod(gamma[], interactions[i,1,])  }
+
+##prior distribution for log-odds in baseline arm of study i
+for (i in 1:Ns) {	u[i] ~ dnorm(0,.01)	}
+
+##prior distribution for heterogeneity	
+prec<-1/tau
+tau~dlnorm(-1.67,inv.sd)
+inv.sd<-1/(1.472*1.472)
+
+
+## SSVS
+## to find the interactions for specific components use the place() function,
+## e.g. run place(2,3) to find the interaction term between components 2 and 3
+  for(k in 1:Ninter){
+    IndA[k] ~ dcat(Pind[])
+    Ind[k] <- IndA[k] - 1
+    gamma[k] ~ dnorm(0, tauCov[IndA[k]])  }
+  
+zeta <- pow(eta, -2)
+eta ~ dnorm(0,1000)I(0,)
+tauCov[1] <- zeta
+tauCov[2] <- zeta * 0.01  # g = 100
+
+  Pind[1] <- 0.5 #P(I_j=1)= 0.5
+  Pind[2] <- 0.5 
+##prior distribution for basic parameters		
+for(k in 1:Nc) {d[k] ~ dnorm(0,.01)}
+for(k in 1:Nc) {ORd[k]<- exp(d[k])}
+
+## example comparisons
+## use the function all.interactions to find the which gamma to include
+## e.g. run all.interactions(c(2,3,4,5,8))
+### (pl + ftf + pe + ps + ive)  VS (wl)
+example1<-exp(d[2]+d[3]+d[4]+d[5]+d[8] +
+gamma[12]+gamma[13]+gamma[14]+gamma[17]+gamma[22]+gamma[23]+gamma[26]+
+gamma[31]+gamma[34]+gamma[41]-d[1]) 
+
+### (pl + ftf + pe + ps + ive + cr)  VS (pl + ftf + ps + mr)
+example2<-exp(d[2]+d[3]+d[4]+d[5]+d[8]+d[11]+
+gamma[12]+gamma[13]+gamma[14]+gamma[17]+gamma[20]+gamma[22]+gamma[23]+
+gamma[26]+gamma[29]+gamma[31]+gamma[34]+gamma[37]+gamma[41]+gamma[44]+
+gamma[59]-d[2]-d[3]-d[5]-d[7]-
+gamma[12]-gamma[14]-gamma[16]-gamma[23]-gamma[25]-gamma[40]) 
+
+
+### (pf + ftf + ps + ive + cr) vs. (pl + pe + br +mr +ine +cr)
+example3<-exp(d[2]+d[3]+d[8]+d[11]+
+gamma[12]+gamma[17]+gamma[20]+gamma[26]+gamma[29]+gamma[59]-
+d[2]-d[4]-d[6] -d[7]-d[9]-d[11] -
+gamma[13]-gamma[15]-gamma[16]-gamma[18]-gamma[20]-gamma[32]-gamma[33]-
+gamma[35]-gamma[37]-gamma[46]-gamma[48]-gamma[50]-gamma[53]-gamma[55]-gamma[62])
+}
+"
+model1.spec<-textConnection(model1.string) 
+data <- list(r=r,n=n, Ns=Ns, Nc=Nc, c1=c1, c2=c2, c3=c3, c4=c4, c5=c5, c6=c6, c7=c7, c8=c8, 
+             c9=c9, c10=c10, c11=c11, c12=c12,  na=na, interactions=interactions, Ninter=Ninter  )
+jags.m=0
+jags.m <- jags.model(model1.spec, data = data, n.chains =4, n.adapt = 10000)
+
+params <- c("tau", "ORd", "gamma", "Ind", "d", "example1", "example2", "example3", "eta") 
+closeAllConnections()
+samps2<- coda.samples(jags.m, params, n.iter =30000)
+
+A2= MCMCsummary(samps2)
+rownames(A2)[which(rownames(A2)=="d[1]"):which(rownames(A2)=="d[12]")]=paste("logOR -", components)
+rownames(A2)[which(rownames(A2)=="ORd[1]"):which(rownames(A2)=="ORd[12]")]=components 
+
+
+MCMCtrace(samps2,pdf = FALSE, params = "d") 
+meanInd=c() 
+for(i in 1:66){
+  meanInd=c(meanInd, mean(rbind(samps2[[1]],samps2[[2]], samps2[[3]], samps2[[4]]) [, paste("Ind[", i,"]", sep="")]))}
+
+medianG=c() 
+for(i in 1:66){  medianG=c(medianG, median(rbind(samps2[[1]],samps2[[2]], samps2[[3]], samps2[[4]])[, paste("gamma[", i,"]", sep="")]))}
+nmax=which(medianG==max(medianG))
+nmin=which(medianG==min(medianG))
+medianG[nmax]
+medianG[nmin]
+meanInd[nmax]
+meanInd[nmin]
+
+meanInd[order(medianG)[1]] 
+meanInd[order(medianG)[2]]
+
+which.place(nmax)
+which.place(nmin)
+
+dev.off()
+ggplot(data.frame("gamma"=medianG, "Ind"=meanInd), aes(x=medianG, y=meanInd)) + 
+  geom_point() + labs(x = "Estimated coefficent of interaction terms (SSVS)")+
+  labs(y = "Variable selection frequency for interaction terms (SSVS)")
+
+
+which.place(nmin) # "mr - cr"
+which.place(nmax) # "ps - ive"
+
+which.place(order(medianG)[1])
+which.place(order(medianG)[4])
+
+A2$results=paste(format(round(A2$`50%`,2), nsmall=2), "[", 
+                 format(round(A2$`2.5%`,2), nsmall=2), ";", 
+                 format(round(A2$`97.5%`,2), nsmall=2), "]", sep="")
+
+
+# SSVS INTERACTION MODEL, with prior for I_k -----------------------------------------------------
+
+model1.string <-  "
+################### AD part
+model {
+for(i in 1:Ns) { 
+w[i,1]<- 0
+theta[i,1]<- 0                                             
+for (k in 1:na[i]) {r[i,k] ~ dbin(p[i,k],n[i,k])}                                                   
+logit(p[i,1])<- u[i]		                    
+for (k in 2:na[i]) {
+logit(p[i,k])<- u[i] + theta[i,k]
+
+##distribution of random effects
+theta[i,k] ~ dnorm(md[i,k],precd[i,k])
+
+## accounting for correlation between effect sizes estimated in multi-arm trials				             
+md[i,k]<- mean[i,k]+ sw[i,k]                                   
+w[i,k]<- (theta[i,k]  - mean[i,k])          
+sw[i,k]<- sum(w[i,1:(k-1)])/(k-1)
+precd[i,k]<- prec *2*(k-1)/k  
+
+##consistency equations
+mean[i,k] <-A1[i,k]-B1[i]
+A1[i,k]<-
+d[1]*(1-equals(c1[i,k],0)) + d[2]*(1-equals(c2[i,k],0))+
+d[3]*(1-equals(c3[i,k],0)) + d[4]*(1-equals(c4[i,k],0)) +
+d[5]*(1-equals(c5[i,k],0)) + d[6]*(1-equals(c6[i,k],0)) + 
+d[7]*(1-equals(c7[i,k],0)) + d[8]*(1-equals(c8[i,k],0)) + 
+d[9]*(1-equals(c9[i,k],0)) + d[10]*(1-equals(c10[i,k],0))+
+d[11]*(1-equals(c11[i,k],0)) + d[12]*(1-equals(c12[i,k],0)) + inprod(gamma[], interactions[i,k,]) }
+
+B1[i]<-
+d[1]*(1-equals(c1[i,1],0))  + d[2]*(1-equals(c2[i,1],0))+
+d[3]*(1-equals(c3[i,1],0))  + d[4]*(1-equals(c4[i,1],0)) +
+d[5]*(1-equals(c5[i,1],0))  + d[6]*(1-equals(c6[i,1],0)) + 
+d[7]*(1-equals(c7[i,1],0))  + d[8]*(1-equals(c8[i,1],0)) + 
+d[9]*(1-equals(c9[i,1],0))  + d[10]*(1-equals(c10[i,1],0)) + 
+d[11]*(1-equals(c11[i,1],0))+ d[12]*(1-equals(c12[i,1],0))+ inprod(gamma[], interactions[i,1,])  }
+
+##prior distribution for log-odds in baseline arm of study i
+for (i in 1:Ns) {	u[i] ~ dnorm(0,.01)	}
+
+##prior distribution for heterogeneity	
+prec<-1/tau
+tau~dlnorm(-1.67,inv.sd)
+inv.sd<-1/(1.472*1.472)
+
+
+## SSVS
+## to find the interactions for specific components use the place() function, e.g. run place(2,3) to find
+## the interaction term between components 2 and 3
+
+## equiprobable interaction terms
+  for(k in c(1:26, 28, 30:34, 36:46, 49:58, 60:66)){
+    IndA[k] ~ dcat(Pind[])
+    Ind[k] <- IndA[k] - 1
+    gamma[k] ~ dnorm(0, tauCov[IndA[k]])  }
+  
+zeta <- pow(eta, -2)
+eta ~ dnorm(0,1000)I(0,)
+tauCov[1] <- zeta
+tauCov[2] <- zeta * 0.01  # g = 100
+
+  Pind[1] <- 0.5 #P(I_j=1)= 0.5
+  Pind[2] <- 0.5 
+
+## interaction terms with prior information
+ for(k in c(27,29, 35, 47, 48, 59)){
+    IndA[k] ~ dcat(Pind1[])
+    Ind[k] <- IndA[k] - 1
+    gamma[k] ~ dnorm(0, tauCov[IndA[k]])  }
+  Pind1[1] <-0.2
+  Pind1[2] <- 0.8 
+
+##prior distribution for basic parameters		
+for(k in 1:Nc) {d[k] ~ dnorm(0,.01)}
+for(k in 1:Nc) {ORd[k]<- exp(d[k])}
+
+
+## example comparisons
+## use the function all.interactions to find the which gamma to include
+## e.g. run all.interactions(c(2,3,4,5,8))
+### (pl + ftf + pe + ps + ive)  VS (wl)
+example1<-exp(d[2]+d[3]+d[4]+d[5]+d[8] +
+gamma[12]+gamma[13]+gamma[14]+gamma[17]+gamma[22]+gamma[23]+gamma[26]+
+gamma[31]+gamma[34]+gamma[41]-d[1]) 
+
+### (pl + ftf + pe + ps + ive + cr)  VS (pl + ftf + ps + mr)
+example2<-exp(d[2]+d[3]+d[4]+d[5]+d[8]+d[11]+
+gamma[12]+gamma[13]+gamma[14]+gamma[17]+gamma[20]+gamma[22]+gamma[23]+
+gamma[26]+gamma[29]+gamma[31]+gamma[34]+gamma[37]+gamma[41]+gamma[44]+
+gamma[59]-d[2]-d[3]-d[5]-d[7]-
+gamma[12]-gamma[14]-gamma[16]-gamma[23]-gamma[25]-gamma[40]) 
+
+
+### (pf + ftf + ps + ive + cr) vs. (pl + pe + br +mr +ine +cr)
+example3<-exp(d[2]+d[3]+d[8]+d[11]+
+gamma[12]+gamma[17]+gamma[20]+gamma[26]+gamma[29]+gamma[59]-
+d[2]-d[4]-d[6] -d[7]-d[9]-d[11] -
+gamma[13]-gamma[15]-gamma[16]-gamma[18]-gamma[20]-gamma[32]-gamma[33]-
+gamma[35]-gamma[37]-gamma[46]-gamma[48]-gamma[50]-gamma[53]-gamma[55]-gamma[62])
+}
+"
+
+
+
+model1.spec<-textConnection(model1.string) 
+data <- list(r=r,n=n, Ns=Ns, Nc=Nc, c1=c1, c2=c2, c3=c3, c4=c4, c5=c5, c6=c6, c7=c7, c8=c8, 
+             c9=c9, c10=c10, c11=c11, c12=c12,  na=na, interactions=interactions)
+jags.m=0
+jags.m <- jags.model(model1.spec, data = data, n.chains =4, n.adapt = 10000)
+
+params <- c("tau", "ORd", "gamma", "Ind", "d", "example1", "example2", "example3") 
+closeAllConnections()
+samps3<- coda.samples(jags.m, params, n.iter =30000)
+
+A3= MCMCsummary(samps3)
+rownames(A3)[which(rownames(A3)=="d[1]"):which(rownames(A3)=="d[12]")]=paste("logOR -", components)
+rownames(A3)[which(rownames(A3)=="ORd[1]"):which(rownames(A3)=="ORd[12]")]=components
+```
+
+
+```{r}
+MCMCtrace(samps3,pdf = FALSE, params = "example1") 
+meanInd=c() 
+for(i in 1:Ninter){
+  meanInd=c(meanInd, mean(rbind(samps3[[1]],samps3[[2]], samps3[[3]], samps3[[4]]) [, paste("Ind[", i,"]", sep="")]))}
+medianG=c() 
+for(i in 1:Ninter){
+  medianG=c(medianG, median(rbind(samps3[[1]],samps3[[2]], samps3[[3]], samps3[[4]])[, paste("gamma[", i,"]", sep="")]))}
+
+
+nmax=which(medianG==max(medianG))
+nmin=which(medianG==min(medianG))
+medianG[nmax]
+medianG[nmin]
+
+meanInd[nmax]
+meanInd[nmin]
+
+which.place(nmax)
+which.place(nmin)
+
+dev.off()
+ggplot(data.frame("gamma"=medianG, "Ind"=meanInd), aes(x=medianG, y=meanInd)) + 
+  geom_point() + labs(x = "Estimated coefficent of interaction terms (SSVS)")+
+  labs(y = "Variable selection frequency for interaction terms (SSVS)")
+
+
+which.place(nmin) 
+which.place(nmax) 
+which.place(order(medianG)[1])
+
+A3$results=paste(format(round(A3$`50%`,2), nsmall=2), "[", 
+                 format(round(A3$`2.5%`,2), nsmall=2), ";", 
+                 format(round(A3$`97.5%`,2), nsmall=2), "]", sep="")
+
+
+
+
+# LASSO INTERACTION MODEL   -----------------------------------------------------
+
+model1.string <-  "
+################### AD part
+model {
+for(i in 1:Ns) { 
+w[i,1]<- 0
+theta[i,1]<- 0                                             
+for (k in 1:na[i]) {r[i,k] ~ dbin(p[i,k],n[i,k])}                                                   
+logit(p[i,1])<- u[i]		                    
+for (k in 2:na[i]) {
+logit(p[i,k])<- u[i] + theta[i,k]
+
+##distribution of random effects
+theta[i,k] ~ dnorm(md[i,k],precd[i,k])
+
+## accounting for correlation between effect sizes estimated in multi-arm trials				             
+md[i,k]<- mean[i,k]+ sw[i,k]                                   
+w[i,k]<- (theta[i,k]  - mean[i,k])          
+sw[i,k]<- sum(w[i,1:(k-1)])/(k-1)
+precd[i,k]<- prec *2*(k-1)/k  
+
+##consistency equations
+mean[i,k] <-A1[i,k]-B1[i]
+A1[i,k]<-
+d[1]*(1-equals(c1[i,k],0)) + d[2]*(1-equals(c2[i,k],0))+
+d[3]*(1-equals(c3[i,k],0)) + d[4]*(1-equals(c4[i,k],0)) +
+d[5]*(1-equals(c5[i,k],0)) + d[6]*(1-equals(c6[i,k],0)) + 
+d[7]*(1-equals(c7[i,k],0)) + d[8]*(1-equals(c8[i,k],0)) + 
+d[9]*(1-equals(c9[i,k],0)) + d[10]*(1-equals(c10[i,k],0))+
+d[11]*(1-equals(c11[i,k],0)) + d[12]*(1-equals(c12[i,k],0)) + inprod(gamma[], interactions[i,k,]) }
+
+B1[i]<-
+d[1]*(1-equals(c1[i,1],0))  + d[2]*(1-equals(c2[i,1],0))+
+d[3]*(1-equals(c3[i,1],0))  + d[4]*(1-equals(c4[i,1],0)) +
+d[5]*(1-equals(c5[i,1],0))  + d[6]*(1-equals(c6[i,1],0)) + 
+d[7]*(1-equals(c7[i,1],0))  + d[8]*(1-equals(c8[i,1],0)) + 
+d[9]*(1-equals(c9[i,1],0))  + d[10]*(1-equals(c10[i,1],0)) + 
+d[11]*(1-equals(c11[i,1],0))+ d[12]*(1-equals(c12[i,1],0))+ inprod(gamma[], interactions[i,1,])  }
+
+##prior distribution for log-odds in baseline arm of study i
+for (i in 1:Ns) {	u[i] ~ dnorm(0,.01)	}
+
+##prior distribution for heterogeneity	
+prec<-1/tau
+tau~dlnorm(-1.67,inv.sd)
+inv.sd<-1/(1.472*1.472)
+
+
+## Bayesian LASSO
+tauGamma <- pow(sdGamma,-1)
+sdGamma ~ dunif(0, 5)
+for(k in 1:Ninter){gamma[k] ~ ddexp(0, tauGamma) }
+
+##prior distribution for basic parameters		
+for(k in 1:Nc) {d[k] ~ dnorm(0,.01)}
+for(k in 1:Nc) {ORd[k]<- exp(d[k])}
+
+
+## example comparisons
+## use the function all.interactions to find the which gamma to include
+## e.g. run all.interactions(c(2,3,4,5,8))
+### (pl + ftf + pe + ps + ive)  VS (wl)
+example1<-exp(d[2]+d[3]+d[4]+d[5]+d[8] +
+gamma[12]+gamma[13]+gamma[14]+gamma[17]+gamma[22]+gamma[23]+gamma[26]+
+gamma[31]+gamma[34]+gamma[41]-d[1]) 
+
+### (pl + ftf + pe + ps + ive + cr)  VS (pl + ftf + ps + mr)
+example2<-exp(d[2]+d[3]+d[4]+d[5]+d[8]+d[11]+
+gamma[12]+gamma[13]+gamma[14]+gamma[17]+gamma[20]+gamma[22]+gamma[23]+
+gamma[26]+gamma[29]+gamma[31]+gamma[34]+gamma[37]+gamma[41]+gamma[44]+
+gamma[59]-d[2]-d[3]-d[5]-d[7]-
+gamma[12]-gamma[14]-gamma[16]-gamma[23]-gamma[25]-gamma[40]) 
+
+
+### (pf + ftf + ps + ive + cr) vs. (pl + pe + br +mr +ine +cr)
+example3<-exp(d[2]+d[3]+d[8]+d[11]+
+gamma[12]+gamma[17]+gamma[20]+gamma[26]+gamma[29]+gamma[59]-
+d[2]-d[4]-d[6] -d[7]-d[9]-d[11] -
+gamma[13]-gamma[15]-gamma[16]-gamma[18]-gamma[20]-gamma[32]-gamma[33]-
+gamma[35]-gamma[37]-gamma[46]-gamma[48]-gamma[50]-gamma[53]-gamma[55]-gamma[62])
+}
+"
+
+
+
+model1.spec<-textConnection(model1.string) 
+data <- list(r=r,n=n, Ns=Ns, Nc=Nc, c1=c1, c2=c2, c3=c3, c4=c4, c5=c5, c6=c6, c7=c7, c8=c8, 
+             c9=c9, c10=c10, c11=c11, c12=c12,  na=na,interactions=interactions, Ninter=Ninter)
+jags.m=0
+jags.m <- jags.model(model1.spec, data = data, n.chains =4, n.adapt = 10000)
+
+params <- c("tau", "ORd", "gamma",  "d", "example1", "example2", "example3") 
+closeAllConnections()
+samps4<- coda.samples(jags.m, params, n.iter =30000)
+
+A4= MCMCsummary(samps4)
+rownames(A4)[which(rownames(A4)=="d[1]"):which(rownames(A4)=="d[12]")]=paste("logOR -", components)
+rownames(A4)[which(rownames(A4)=="ORd[1]"):which(rownames(A4)=="ORd[12]")]=components 
+
+
+MCMCtrace(samps4,pdf = FALSE, params = "example1") 
+
+medianG=c() 
+for(i in 1:Ninter){
+  medianG=c(medianG, median(rbind(samps4[[1]],samps4[[2]], samps4[[3]], samps4[[4]])[, paste("gamma[", i,"]", sep="")]))}
+
+
+nmax=which(medianG==max(medianG))
+nmin=which(medianG==min(medianG))
+medianG[nmax]
+medianG[nmin]
+
+
+which.place(nmin) 
+which.place(nmax) 
+
+A4$results=paste(format(round(A4$`50%`,2), nsmall=2), "[", 
+                 format(round(A4$`2.5%`,2), nsmall=2), ";", 
+                 format(round(A4$`97.5%`,2), nsmall=2), "]", sep="")
+
+
+
+# summarize results -------------------------------------------------------
+
+summ=cbind(A1[c(which(rownames(A1)=="logOR - wl"):which(rownames(A1)=="logOR - w3"), which(rownames(A1)=="tau"),which(rownames(A1)=="example1"), 
+                which(rownames(A1)=="example2"), which(rownames(A1)=="example3")),c("results")], 
+      A2[c(which(rownames(A2)=="logOR - wl"):which(rownames(A2)=="logOR - w3"), which(rownames(A2)=="tau"),which(rownames(A2)=="example1"), 
+           which(rownames(A2)=="example2"), which(rownames(A2)=="example3")),c("results")], 
+      A3[c(which(rownames(A3)=="logOR - wl"):which(rownames(A3)=="logOR - w3"), which(rownames(A3)=="tau"),which(rownames(A3)=="example1"), 
+           which(rownames(A3)=="example2"), which(rownames(A3)=="example3")),c("results")], 
+      A4[c(which(rownames(A4)=="logOR - wl"):which(rownames(A4)=="logOR - w3"), which(rownames(A4)=="tau"),which(rownames(A4)=="example1"), 
+           which(rownames(A4)=="example2"), which(rownames(A4)=="example3")),c("results")]
+      )
+rownames(summ)=c(components, "tau", "comparison I", "comparison II", "comparison III")
+colnames(summ)=c("no interactions", "SSVS (equiprobable interactions)", "SSVS (informative priors about interactions", "Bayesian LASSO")
+
+
+write.xlsx(summ, "panic disorder results.xlsx", 
+           sheetName = "Sheet1",
+           rowNames = FALSE,
+           colNames = TRUE)
+```
+
